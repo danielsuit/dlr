@@ -1,4 +1,4 @@
-# CascadeLog: An Append-Log Replication and Coded-Transfer Protocol for High-Volume Harness→Gateway Context
+# dlr: An Append-Log Replication and Coded-Transfer Protocol for High-Volume Harness→Gateway Context
 
 **Status:** Design draft
 **Scope:** Moving a growing (→50M-token) Claude Code message list to a remote runtime that prunes to ~100k, without re-sending the history, without exposing the pruning algorithm, and without bottlenecking on the expensive prune.
