@@ -199,7 +199,7 @@ impl ZeckStream {
 
     /// Decode all codewords in a packed buffer, undoing the +1 stream shift.
     /// `i` counts **bits**, so codewords can start mid-byte. Scanning stops
-    /// cleanly when [`decode_at`] runs off the end (no terminator in the
+    /// cleanly when `decode_at` runs off the end (no terminator in the
     /// trailing zero padding).
     pub fn decode_all(buf: &[u8]) -> Vec<u64> {
         let mut out = Vec::new();

@@ -1,7 +1,7 @@
 //! Wire frames (DESIGN §3.2, §3.3).
 //!
 //! Steady-state frame:
-//!   APPEND { session_id : u128, base_root : [u8;32], blocks : [FrameBlock],
+//!   APPEND { session_id : u128, base_root : `[u8;32]`, blocks : [FrameBlock],
 //!            coeff_hdr : optional }
 //! The single `base_root` replaces any per-block manifest on the hot path.
 //!

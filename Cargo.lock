@@ -226,6 +226,7 @@ dependencies = [
  "dlr-coding",
  "dlr-compress",
  "dlr-core",
+ "dlr-shim",
  "parking_lot",
  "rayon",
  "thiserror",

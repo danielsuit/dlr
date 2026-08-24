@@ -19,6 +19,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 
 use dlr_compress::Compressor;
 use dlr_core::{
@@ -268,10 +269,16 @@ impl SessionShim {
             return Ok(Vec::new());
         }
 
-        // serialize + compress each missing block into a flat byte stream,
-        // length-prefixed so the receiver can split the decoded generation back
-        // into block boundaries: [len:u32][compressed canonical bytes] per block.
-        let mut flat: Vec<u8> = Vec::new();
+        // Serialize + compress each missing block into a self-framed record
+        // `[len:u32][compressed canonical bytes]`. We keep the records separate
+        // so we can shard the stream at *block* boundaries (below): every
+        // generation then contains only whole records, so the receiver's
+        // per-generation parser can split its decoded bytes back into blocks
+        // without a record ever straddling a generation boundary. (Splitting the
+        // flat stream at fixed byte offsets instead — `k * sym` per generation —
+        // would cut records mid-frame and leave every generation after the first
+        // starting in the middle of a record, which the parser reads as garbage.)
+        let mut records: Vec<Vec<u8>> = Vec::with_capacity(missing.len());
         for id in missing {
             if let Some(b) = self.store.get(id) {
                 let c = canonical_bytes(&b);
@@ -279,71 +286,69 @@ impl SessionShim {
                     .compressor
                     .compress(&c)
                     .map_err(|e| ShimError::Compress(e.to_string()))?;
-                flat.extend_from_slice(&(z.len() as u32).to_le_bytes());
-                flat.extend_from_slice(&z);
+                let mut rec = Vec::with_capacity(4 + z.len());
+                rec.extend_from_slice(&(z.len() as u32).to_le_bytes());
+                rec.extend_from_slice(&z);
+                records.push(rec);
             }
         }
 
         let k = self.fountain_k as usize;
         let sym = self.fountain_symbol_size as usize;
+        let full_gen_bytes = k * sym;
+        let repair_fraction = (repair_margin_pct as f64) / 100.0;
 
-        // Delegate the generation-slicing + fountain coding to
-        // `dlr_coding::bulk::encode`. It shares the payload by `Arc` across the
-        // rayon tasks (each task bumps the refcount instead of cloning its `k`
-        // symbols — the old loop here paid one `flat[i*sym..].to_vec()` per
-        // source symbol) and parallelizes per-generation.
-        //
-        // `encode` pads every generation out to a uniform K. To avoid padding a
-        // *small* cold-start (fewer than `k` source symbols) out to a full
-        // generation — which would emit ~K coded symbols for a handful of real
-        // ones — size `gen_size` to the actual source-symbol count when it is
-        // smaller than `k`. A large cold-start still uses full `k`-symbol
-        // generations (many of them); only the trailing one is padded, which is
-        // negligible across a 200 MB transfer.
-        let total_syms = flat.len().div_ceil(sym).max(1);
-        let gen_size = k.min(total_syms).max(1);
-        let cfg = dlr_coding::bulk::BulkConfig {
-            gen_size,
-            symbol_size: sym,
-            repair_fraction: (repair_margin_pct as f64) / 100.0,
-            generations: 0, // unused by `encode`; it derives the count from the payload
-        };
-        let coded =
-            dlr_coding::bulk::encode(&flat, &cfg).map_err(|e| ShimError::Coding(e.to_string()))?;
-
-        // `encode` emits its flat `(gen_id, wire)` output in generation order
-        // (rayon preserves the order of its parallel range), so group the
-        // output into one `BulkFrame` per generation by walking consecutive
-        // equal `gen_id`s. K is uniform per transfer (= `gen_size`).
-        let sid = self.session_id;
-        let mut frames: Vec<BulkFrame> = Vec::new();
-        let mut cur_gen = u32::MAX;
-        let mut cur_syms: Vec<Bytes> = Vec::new();
-        for (gen, w) in coded {
-            if gen != cur_gen {
-                if cur_gen != u32::MAX {
-                    frames.push(BulkFrame {
-                        session_id: sid,
-                        generation: cur_gen,
-                        k: gen_size as u32,
-                        symbol_size: sym as u32,
-                        symbols: std::mem::take(&mut cur_syms),
-                    });
-                }
-                cur_gen = gen;
+        // Shard the records into generations at block boundaries: pack as many
+        // whole records as fit in one `k * sym` generation, then start the next.
+        // A record larger than a full generation becomes its own (oversized)
+        // generation whose `gen_size` is sized to the record so the fountain
+        // still has a uniform K.
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        for rec in &records {
+            if !cur.is_empty() && cur.len() + rec.len() > full_gen_bytes {
+                chunks.push(std::mem::take(&mut cur));
             }
-            cur_syms.push(Bytes::from(w));
+            cur.extend_from_slice(rec);
         }
-        if cur_gen != u32::MAX {
-            frames.push(BulkFrame {
-                session_id: sid,
-                generation: cur_gen,
-                k: gen_size as u32,
-                symbol_size: sym as u32,
-                symbols: cur_syms,
-            });
+        if !cur.is_empty() {
+            chunks.push(cur);
         }
-        Ok(frames)
+
+        // Encode each chunk as one independent fountain generation, in parallel
+        // across chunks. `dlr_coding::bulk::encode` pads each chunk out to a
+        // uniform K (= its symbol count) with zero symbols the receiver's parser
+        // discards at the first `[len == 0]`. Each generation is independently
+        // decodable, so out-of-order BULK delivery (multipath / multicast) is
+        // correct and the receiver decodes whichever generations finish first.
+        let sid = self.session_id;
+        let frames: Result<Vec<BulkFrame>, ShimError> = chunks
+            .par_iter()
+            .enumerate()
+            .map(|(gen, chunk)| {
+                let gen_size = chunk.len().div_ceil(sym).max(1);
+                let cfg = dlr_coding::bulk::BulkConfig {
+                    gen_size,
+                    symbol_size: sym,
+                    repair_fraction,
+                    generations: 0, // `encode` derives the count from the payload
+                };
+                let coded = dlr_coding::bulk::encode(chunk, &cfg)
+                    .map_err(|e| ShimError::Coding(e.to_string()))?;
+                // `encode` numbers its single generation 0; renumber to this
+                // chunk's generation id so the receiver's per-generation
+                // decoders stay distinct across chunks.
+                let symbols = coded.into_iter().map(|(_, w)| Bytes::from(w)).collect();
+                Ok(BulkFrame {
+                    session_id: sid,
+                    generation: gen as u32,
+                    k: gen_size as u32,
+                    symbol_size: sym as u32,
+                    symbols,
+                })
+            })
+            .collect();
+        frames
     }
 }
 

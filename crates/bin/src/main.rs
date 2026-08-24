@@ -123,18 +123,67 @@ fn main() {
         .bulk_frames_for(&missing, 5)
         .expect("bulk");
     let mut bulk_wire = 0usize;
-    for b in &bulk {
+    let mut completion_root = None;
+    // Deliver generations OUT OF ORDER (reverse) to demonstrate that BULK
+    // arrival order is irrelevant: each generation is independently decodable,
+    // and the completion ACK fires once every missing block has arrived — not
+    // in generation order. (The flat stream is chunked at block boundaries, so
+    // no block frame straddles a generation.)
+    for b in bulk.iter().rev() {
         let f = encode_frame(&Frame::Bulk(b.clone()));
         bulk_wire += f.len();
         let decoded = decode_frame_bytes(&f).expect("decode bulk");
-        cold_receiver.handle_frame(decoded).expect("handle bulk");
+        if let Some(Frame::Ack(a)) = cold_receiver.handle_frame(decoded).expect("handle bulk") {
+            completion_root = Some(a.root);
+        }
     }
+    let completion_root =
+        completion_root.expect("cold start must complete with an ACK of the client root");
+    assert_eq!(
+        completion_root, resync.client_root,
+        "completion ACK must equal the client root"
+    );
     println!(
-        "BULK coded transfer: {} generations, {} wire bytes (coded only the {}-block gap)",
+        "BULK coded transfer: {} generations (delivered reverse-order), {} wire bytes (coded only the {}-block gap)",
         bulk.len(),
         bulk_wire,
         missing.len()
     );
+
+    // Post-cold-start steady-state resumption: the completion ACK tells the shim
+    // the receiver has caught up, so it advances base_root and ordinary APPENDs
+    // resume against the (now-warm) cold receiver.
+    assert!(
+        shim.apply_ack(session_id, completion_root),
+        "completion ACK advances shim base_root"
+    );
+    let resume_blocks = vec![Block::new(
+        BlockKind::Message,
+        999,
+        Bytes::from_static(b"post-cold-start turn"),
+    )];
+    let resume_append = shim.ingest(session_id, resume_blocks.clone());
+    let resume_wire = encode_frame(&Frame::Append(resume_append));
+    match cold_receiver
+        .handle_frame(decode_frame_bytes(&resume_wire).expect("decode resume"))
+        .expect("handle resume")
+    {
+        Some(Frame::Ack(a)) => {
+            assert_eq!(
+                a.root,
+                shim.session(session_id).root(),
+                "post-cold-start APPEND root must match the shim root"
+            );
+            assert!(
+                shim.apply_ack(session_id, a.root),
+                "resume ACK advances shim base"
+            );
+            println!(
+                "post-cold-start resumption: 1 turn appended to the warmed cold receiver; roots match"
+            );
+        }
+        other => panic!("expected ACK after post-cold-start APPEND, got {other:?}"),
+    }
 
     // Off-hot-path prune to a ~100k-token window.
     println!("\n--- prune (off hot path, priority scheduler) ---");

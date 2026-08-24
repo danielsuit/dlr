@@ -307,7 +307,7 @@ unsafe fn scal_neon(tabs: &[u8; 32], dst: &mut [u8], n: usize) {
 /// `axpy(dst, a, src)`: `dst[i] ^= gf_mul(a, src[i])` in place — the building
 /// block of Gaussian elimination and random linear combinations. SIMD-accelerated
 /// via [`gf_axpy_slice`]; the zero and identity coefficients are fast-pathed
-/// (MUL[a][0] == 0 covers the zero case, identity is a plain XOR).
+/// (`MUL[a][0] == 0` covers the zero case, identity is a plain XOR).
 #[inline]
 pub fn axpy(dst: &mut [u8], a: u8, src: &[u8]) {
     gf_axpy_slice(a, src, dst);
@@ -345,7 +345,7 @@ pub fn mul(a: u8, b: u8) -> u8 {
     gf_mul(a, b)
 }
 
-/// Inverse in GF(2^8) via exp[-log[a]] = exp[255 - log[a]].
+/// Inverse in GF(2^8) via `exp[-log[a]] = exp[255 - log[a]]`.
 #[inline]
 pub fn gf_inv(a: u8) -> u8 {
     if a == 0 {
@@ -369,7 +369,7 @@ pub fn gf_div(a: u8, b: u8) -> u8 {
     t.exp[l]
 }
 
-/// A linear combination: out = sum coeffs[i] * vecs[i][row] over GF(2^8).
+/// A linear combination: `out = sum coeffs[i] * vecs[i][row]` over GF(2^8).
 /// Each term is an SIMD-accelerated axpy into `out`.
 pub fn gf_dot(coeffs: &[u8], rows: &[&[u8]]) -> Vec<u8> {
     if rows.is_empty() {

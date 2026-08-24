@@ -6,7 +6,7 @@ This repo is the **implementation** of [`DESIGN.md`](./DESIGN.md). See [`BENCHMA
 
 ## Status
 
-Fully implemented across a Rust workspace; builds clean in release (`cargo build --release`), all unit/property tests pass (`cargo test --release`), and the demo binary runs the full steady-state + cold-start path end-to-end (`cargo run --release`).
+Fully implemented across a Rust workspace; builds clean in release (`cargo build --release`), all unit/property/integration tests pass (`cargo test --release` — including the protocol-lifecycle suite in `dlr-receiver` that drives a real `Shim` against a real `Receiver` over the frame codec, covering steady state, dedup, the full cold-start handshake, out-of-order BULK delivery, post-cold-start resumption, and cold-start WAL durability so a cold-started session survives a receiver restart without a re-transfer), and the demo binary runs the full steady-state + cold-start path end-to-end (`cargo run --release`).
 
 ## Workspace layout
 

@@ -11,11 +11,21 @@
 //! path stays cheap while crash-safety is tunable.
 //!
 //! Record format (all little-endian):
-//!   `session_id : 16` | `variant : 1` (0=insert, 1=reference) | `len : u4` | `bytes[len]`
-//! For `insert`, `bytes` is the block's canonical encoding; for `reference`,
-//! `bytes` is the 32-byte `block_id`. Replay re-runs `insert`/`reference` in
-//! order, so session logs and Merkle roots rebuild identically (the DAG is a
-//! deterministic function of the ordered block ids).
+//!   `session_id : 16` | `variant : 1` | `len : u4` | `bytes[len]`
+//! `variant`:
+//!   0 = insert     — `bytes` is the block's canonical encoding; replay re-inserts
+//!                     (appends the id to the session log, re-derives the root).
+//!   1 = reference  — `bytes` is the 32-byte `block_id`; replay re-references.
+//!   2 = seed      — RESYNC: `count:u32 | count*32 ids | 32 root`; replay seeds
+//!                     the session log in *manifest* order (the authoritative order).
+//!   3 = content   — BULK: `bytes` is canonical encoding; replay stores the block
+//!                     *content only* (no session-log append; the log was seeded).
+//!
+//! For steady-state `insert`/`reference`, replay re-runs them in order, so session
+//! logs and Merkle roots rebuild identically (the DAG is a deterministic function
+//! of the ordered block ids). For a cold-started session, a `seed` record fixes the
+//! manifest order up front and `content` records fill block content without
+//! disturbing that order — so an out-of-order cold start replays to the same root.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -27,6 +37,15 @@ use crate::store::ContentStore;
 
 const VAR_INSERT: u8 = 0;
 const VAR_REFERENCE: u8 = 1;
+/// Seed a session log at RESYNC: the full manifest id list + the client root,
+/// in manifest (authoritative) order. Replay rebuilds the session log in this
+/// order regardless of the BULK arrival order, so "cold resume paid ONCE"
+/// survives a receiver restart even after an out-of-order cold start.
+const VAR_SEED: u8 = 2;
+/// Cold-start block content (BULK). Same on-disk shape as `VAR_INSERT`
+/// (canonical bytes), but replayed as content-only: it fills the block map
+/// WITHOUT appending to the session log (the log was seeded by `VAR_SEED`).
+const VAR_CONTENT: u8 = 3;
 const HEADER: usize = 16 + 1 + 4;
 // NOTE: `HEADER` is still referenced by `replay` (which reads a fixed-size
 // header buffer); the append path now writes the fields directly instead of
@@ -83,6 +102,37 @@ impl Wal {
         w.write_all(&id)
     }
 
+    /// Append a SEED record: the session's full manifest id list + client root.
+    /// Recorded once at RESYNC so replay rebuilds the session log in manifest
+    /// order. Payload layout: `count:u32 | count*32 id bytes | 32 root bytes`.
+    pub fn append_seed(
+        &self,
+        session_id: u128,
+        ids: &[[u8; 32]],
+        root: &[u8; 32],
+    ) -> std::io::Result<()> {
+        let mut w = self.writer.lock();
+        w.write_all(&session_id.to_le_bytes())?;
+        w.write_all(&[VAR_SEED])?;
+        let len = 4 + ids.len() * 32 + 32;
+        w.write_all(&(len as u32).to_le_bytes())?;
+        w.write_all(&(ids.len() as u32).to_le_bytes())?;
+        for id in ids {
+            w.write_all(&id[..])?;
+        }
+        w.write_all(&root[..])
+    }
+
+    /// Append a CONTENT record: cold-start block content (BULK). Replayed as
+    /// content-only (no session-log append). Same payload shape as `append_insert`.
+    pub fn append_content(&self, session_id: u128, canonical: &[u8]) -> std::io::Result<()> {
+        let mut w = self.writer.lock();
+        w.write_all(&session_id.to_le_bytes())?;
+        w.write_all(&[VAR_CONTENT])?;
+        w.write_all(&(canonical.len() as u32).to_le_bytes())?;
+        w.write_all(canonical)
+    }
+
     /// Flush the in-process buffer. With `sync=true`, also fsync the file
     /// descriptor so records survive a crash. Batching flushes (e.g. once per
     /// turn or per flush tick) keeps the hot path off the fsync latency.
@@ -125,6 +175,33 @@ fn replay<R: Read>(mut r: R, store: &ContentStore) -> std::io::Result<()> {
                     let mut id = [0u8; 32];
                     id.copy_from_slice(&payload);
                     let _ = store.reference(session_id, id);
+                }
+            }
+            VAR_SEED => {
+                // Payload: count:u32 | count*32 ids | 32 root. Rebuild the
+                // session log in manifest order. `store.seed_session` does not
+                // re-log (the WAL is still unset during replay).
+                if payload.len() >= 4 {
+                    let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+                    let need = 4 + count * 32 + 32;
+                    if payload.len() >= need {
+                        let mut ids = Vec::with_capacity(count);
+                        for i in 0..count {
+                            let mut id = [0u8; 32];
+                            id.copy_from_slice(&payload[4 + i * 32..4 + i * 32 + 32]);
+                            ids.push(id);
+                        }
+                        let mut root = [0u8; 32];
+                        root.copy_from_slice(&payload[4 + count * 32..4 + count * 32 + 32]);
+                        store.seed_session(session_id, ids, root);
+                    }
+                }
+            }
+            VAR_CONTENT => {
+                // Cold-start block content: store the block without appending to
+                // the session log (the log was seeded by a prior VAR_SEED).
+                if let Ok(block) = crate::canonical::from_canonical(&payload) {
+                    store.store_content(session_id, block);
                 }
             }
             _ => { /* unknown variant from a future version: skip */ }

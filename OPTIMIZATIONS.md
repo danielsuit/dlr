@@ -5,22 +5,37 @@ and verifying against a building baseline.
 
 ## Critical context (read first)
 
-- **The workspace did not compile.** `crates/core/src/lib.rs:22` re-exported
-  `block::Block::block_id_from_canonical`, but `block_id_from_canonical` is an
-  inherent associated function and that path is not a valid `pub use` target
-  ("`Block` is a struct, not a module"). Fixed by converting it to a free
-  function in `block.rs` (matching `canonical_bytes`/`from_canonical`) and
-  re-exporting `block::block_id_from_canonical`. The build is now green.
-- **6 tests fail on `main`, independent of the fix:** `bulk::parallel_bulk_roundtrip`,
-  `fountain::systematic_plus_repairs_decode`, `fountain::peeling_handles_heavy_loss_with_repairs`,
+> **Update (2026-08-23):** the baseline issues called out below have been
+> resolved. The workspace now compiles clean (`cargo build`) and **all tests
+> pass** (64 tests across 8 crates, including 11 protocol-lifecycle tests in
+> `dlr-receiver`). The `block_id_from_canonical` re-export problem and the
+> failing tests (including the `fib_hash64` top-bits collision bug) are fixed.
+> Treat the per-plan adoption status in this document as **stale** — several
+> plans have since been implemented; verify against the code, not this doc.
+
+Analysis performed 2026-08-13 by reading every source file in the workspace (~6k LOC, 8 crates)
+and verifying against a building baseline.
+
+Original findings (historical, since fixed):
+
+- **The workspace did not compile at the time.** `crates/core/src/lib.rs:22`
+  re-exported `block::Block::block_id_from_canonical`, but
+  `block_id_from_canonical` is an inherent associated function and that path is
+  not a valid `pub use` target ("`Block` is a struct, not a module"). Fixed by
+  converting it to a free function in `block.rs` (matching
+  `canonical_bytes`/`from_canonical`) and re-exporting
+  `block::block_id_from_canonical`.
+- **6 tests failed on `main` at the time**, independent of the fix:
+  `bulk::parallel_bulk_roundtrip`,
+  `fountain::systematic_plus_repairs_decode`,
+  `fountain::peeling_handles_heavy_loss_with_repairs`,
   `rlnc::sparse_roundtrip_peels`, `fib_hash::distributes_consecutive_keys`,
-  `placement::balanced_at_every_n`. Several are real correctness bugs (e.g.
-  `fib_hash64` hashes the *top* bits of `hi*GOLDEN ^ lo`, which are zero for
-  keys < 2^56, so all small keys collide in shard 0). Plans #10 and #1 touch
-  this code; the underlying decode/hash bugs should be fixed before or
-  alongside the perf work.
+  `placement::balanced_at_every_n`. Several were real correctness bugs (e.g.
+  `fib_hash64` hashed the *top* bits of `hi*GOLDEN ^ lo`, which are zero for
+  keys < 2^56, so all small keys collided in shard 0). Now fixed.
 - **Dead dependencies:** `serde`, `serde_json`, `crc32fast`, `dashmap`, and
-  `rand` are declared but referenced nowhere in `crates/*/src`. See Plan #20.
+  `rand` were declared but referenced nowhere in `crates/*/src`. (Some, e.g.
+  `dashmap`, are now used — verify against the current `Cargo.toml` files.)
 
 Plans are ordered roughly hot-path-first. Effort: **S** small, **M** medium,
 **L** large.
@@ -407,11 +422,49 @@ if/when #1 lands.
 # Part II — 20 more optimization plans
 
 Analysis performed 2026-08-13 by re-reading every source file in the workspace
-after the first 20 plans were drafted. **Adoption status of Part I:** #1–#6 are
-implemented (DashMap store, single `entry` lookup, cuckoo `grow`/`clear` +
-golden-ratio mix, `canonical_bytes_and_id`, WAL direct writes); #10a (`mem::take`
-in the peeler) is in; #7–#19 and #10b/#20 remain open. The plans below are new,
-verified against the *current* code. Ordered hot-path-first; effort S/M/L.
+after the first 20 plans were drafted, then re-audited 2026-08-24 against the
+current code. **Adoption status (audited against code, not the doc):**
+
+- **Implemented (36 of 40):** #1–#18, #20, #22–#35, #37–#39 — including the
+  large ones the original sequencing gated on benchmarks: #7 (GF(256) SIMD
+  `pshufb` kernels, x86 SSE2/AVX2 + aarch64 NEON + scalar fallback), #8 (flat
+  matrix `gf_gauss_eliminate`), #30 (arena-linked persistent MMR), #34
+  (parallel pre-sized bulk reassembly), #39 (Arc-shared hierarchical groups).
+- **#19 — realized via the incremental path:** the N-independent prune is
+  `IncrementalPruneScheduler` (O(log K)/block, O(K)/window), implemented and
+  covered by `incremental_window_size_is_independent_of_log_length` (1k vs
+  100k blocks, same survivor count under a fixed budget). `ImportancePolicy`
+  remains as a *stateless one-shot baseline* for snapshot pruning; it is not
+  the production path. The faithful "real" scorer plugs in at
+  `IncrementalPruner::new_with`.
+- **#21 — substantially done:** the query path takes one shared `RwLock` read
+  (concurrent readers never block each other) with an atomic mask; the
+  original 3× global `Mutex` complaint is fixed. The plan's *ideal* lock-free
+  `Arc<Vec>` buckets is deferred — it needs hand-rolled unsafe `AtomicPtr`
+  arc-swap or a new `arc-swap` dependency for a marginal gain over an already
+  cheap shared read.
+- **#28 — implemented (this PR):** the receiver's duplicate per-session id list
+  (`SessionState.ids`/`root`) is removed. After the cold-start `seed_session`
+  fix the store's session log is the single manifest-ordered source of truth
+  for ids and root, so `reconstruct`/`pointer`/`session_root` read the store
+  directly.
+- **#36 — deferred:** the passthrough marker (0x00/0x01) is a load-bearing
+  wire-format contract embedded in the compressed payload. Removing the
+  full-input copy needs the marker moved out-of-band into the frame's per-block
+  length prefix — a cross-cutting change to compress, the frame codec, shim,
+  receiver, and bulk framing — for a benefit limited to incompressible blocks
+  (rare in text-heavy SWE traces). Not worth the wire-format risk for this PR.
+- **#40 — intentionally not done:** the lock-free `store.session_root()`
+  divergence pre-check was *removed* for correctness. It used the store's
+  insertion-order root as a proxy for the authoritative root, which diverges
+  after an *out-of-order* cold start and spuriously rejected the first
+  post-cold-start APPEND (livelock). The authoritative in-lock
+  `SessionState`→store check is the oracle; divergent APPENDs (rare, only on
+  the cold-start transition) pay the resolve before being rejected — an
+  acceptable trade for correctness.
+
+The plans below are the original text (verified against the *current* code).
+Ordered hot-path-first; effort S/M/L.
 
 ## 21. CuckooFilter: remove the global `Mutex` from the query path
 **Location:** `crates/core/src/filter.rs:93-99, 101-107, 121, 161-175`

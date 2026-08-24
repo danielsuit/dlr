@@ -268,6 +268,92 @@ impl ContentStore {
         Ok(())
     }
 
+    /// Seed a session log with the full manifest + target root at RESYNC, before
+    /// any block content has arrived via BULK. The store's session log is the
+    /// *authoritative* order (manifest order) from the outset; BULK then fills in
+    /// block content via [`ContentStore::store_content_with_id`] *without* appending to the
+    /// log, so out-of-order generation arrival leaves the log and root correct.
+    /// Durably logs a SEED record so a restart replays the manifest order (not
+    /// arrival order) and "cold resume paid ONCE" survives a receiver restart.
+    /// Idempotent in shape: re-seeding overwrites the log (used by replay).
+    pub fn seed_session(&self, session_id: u128, ids: Vec<BlockId>, root: MerkleRoot) {
+        let wal = self.wal();
+        // Clone for the WAL record before `ids` is moved into the session log.
+        let wal_ids = if wal.is_some() {
+            Some(ids.clone())
+        } else {
+            None
+        };
+        let was_new = match self.sessions.entry(session_id) {
+            Entry::Occupied(mut o) => {
+                let log = o.get_mut();
+                log.ids = ids;
+                log.root = root;
+                false
+            }
+            Entry::Vacant(v) => {
+                v.insert(SessionLog { ids, root });
+                true
+            }
+        };
+        if was_new {
+            self.stats.sessions.fetch_add(1, Ordering::Relaxed);
+        }
+        if let (Some(wal), Some(ids)) = (wal, wal_ids) {
+            let _ = wal.append_seed(session_id, &ids, &root);
+        }
+    }
+
+    /// Store cold-start block *content* (from BULK) without appending to the
+    /// session log — the log was seeded at RESYNC by [`ContentStore::seed_session`]. This is
+    /// the content-only counterpart of [`ContentStore::insert_with_id`]: it populates the
+    /// content map (and dedup stats) and shadows a CONTENT record to the WAL,
+    /// but does not touch the session log or root. Arrival/decode order is
+    /// therefore irrelevant to the durable log. Returns `true` if newly stored.
+    pub fn store_content_with_id(&self, session_id: u128, block: Block, id: BlockId) -> bool {
+        let wal = self.wal();
+        let block_for_wal = if wal.is_some() {
+            Some(block.clone())
+        } else {
+            None
+        };
+        let payload_len = block.payload.len() as u64;
+        let newly = match self.blocks.entry(id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(block);
+                true
+            }
+        };
+        if newly {
+            self.stats.blocks_stored.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .bytes_stored
+                .fetch_add(payload_len, Ordering::Relaxed);
+        } else {
+            self.stats.blocks_deduped.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(wal) = wal {
+            if newly {
+                if let Some(b) = block_for_wal {
+                    // Re-derive canonical only on the WAL path (no-WAL fast path
+                    // touches no payload-sized alloc); same trade as `insert_with_id`.
+                    let c = canonical_bytes(&b);
+                    let _ = wal.append_content(session_id, &c);
+                }
+            }
+            // dedup: content is already durably present, log nothing.
+        }
+        let _ = session_id; // session log untouched; kept for API symmetry / WAL key
+        newly
+    }
+
+    /// Convenience: store content, deriving the id from the block (replay path).
+    pub fn store_content(&self, session_id: u128, block: Block) -> bool {
+        let id = block.block_id();
+        self.store_content_with_id(session_id, block, id)
+    }
+
     pub fn get(&self, id: &BlockId) -> Option<Block> {
         self.blocks.get(id).map(|r| (*r).clone())
     }
@@ -296,6 +382,12 @@ impl ContentStore {
             .get(&session_id)
             .map(|l| l.ids.clone())
             .unwrap_or_default()
+    }
+
+    /// All known session ids. Used by the receiver to rebuild `SessionState`
+    /// for every session a WAL replay restored into the store.
+    pub fn session_list(&self) -> Vec<u128> {
+        self.sessions.iter().map(|r| *r.key()).collect()
     }
 
     pub fn stats(&self) -> StoreStats {

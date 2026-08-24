@@ -1,6 +1,6 @@
 # dlr: An Append-Log Replication and Coded-Transfer Protocol for High-Volume Harness→Gateway Context
 
-**Status:** Design draft
+**Status:** Implemented — Rust workspace (8 crates) builds clean, 64 tests pass, end-to-end demo runs. This document is the design rationale; the code is the source of truth.
 **Scope:** Moving a growing (→50M-token) Claude Code message list to a remote runtime that prunes to ~100k, without re-sending the history, without exposing the pruning algorithm, and without bottlenecking on the expensive prune.
 **Audience:** systems + ML infra (Rust gateway, Baseten/GLM-5.2 backend, Nightshift multi-agent, ConnectX/BlueField fabric).
 

@@ -435,4 +435,48 @@ mod scheduler_tests {
         assert!(total_bytes <= 300, "over budget: {total_bytes}");
         assert_eq!(w.blocks.len(), 3);
     }
+
+    /// The incremental prune's window is **independent of the log length N**: its
+    /// size is bounded by the token budget (O(K)), not the growing history. This
+    /// is the structural property the stateless `ImportancePolicy` re-scan lacks
+    /// (it is O(N log N) in N). Grow the log 100× (1k -> 100k blocks) under a
+    /// fixed budget and assert the survivor count and total size stay ~constant
+    /// — i.e. producing the window did not grow with N. (Plan #19.)
+    #[test]
+    fn incremental_window_size_is_independent_of_log_length() {
+        let session: u128 = 0x0005_CA1E;
+        let budget = 5000;
+        let block_bytes = 10;
+        let window_for = |n: usize| {
+            let receiver = Arc::new(Receiver::new(ContentStore::new(), Compressor::default()));
+            for i in 0..n as u64 {
+                let b = Block::new(BlockKind::Message, i, vec![0u8; block_bytes]);
+                receiver.store().insert(session, b);
+            }
+            let sched = IncrementalPruneScheduler::new(receiver.clone(), budget);
+            sched.ingest_session(session);
+            let w = sched
+                .window(session)
+                .expect("ingested session has a window");
+            // survivors in log order
+            let seqs: Vec<u64> = w.blocks.iter().map(|b| b.seq).collect();
+            assert!(
+                seqs.windows(2).all(|s| s[0] < s[1]),
+                "window not in log order at N={n}: {seqs:?}"
+            );
+            let total: usize = w.blocks.iter().map(|b| b.payload.len()).sum();
+            assert!(
+                total <= budget || w.blocks.len() == 1,
+                "over budget at N={n}: {total}"
+            );
+            (w.blocks.len(), total)
+        };
+        let (n1, t1) = window_for(1_000);
+        let (n2, t2) = window_for(100_000);
+        // 100x more history, same survivor count and total size (both bounded by
+        // the budget, not N). The window keeps the most recent `budget /
+        // block_bytes` blocks in both cases.
+        assert_eq!(n1, n2, "survivor count grew with N: {n1} -> {n2}");
+        assert_eq!(t1, t2, "total size grew with N: {t1} -> {t2}");
+    }
 }
