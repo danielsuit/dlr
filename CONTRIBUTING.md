@@ -12,7 +12,7 @@ privately according to [SECURITY.md](SECURITY.md).
 Install Git and Rust 1.89 or newer, then clone and test the workspace:
 
 ```sh
-git clone https://github.com/subconscious-systems/dlr.git
+git clone https://github.com/danielsuit/dlr.git
 cd dlr
 cargo test --locked --workspace --all-targets
 ```

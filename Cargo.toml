@@ -18,8 +18,8 @@ edition = "2021"
 rust-version = "1.89"
 license = "MIT"
 authors = ["Daniel Suit"]
-repository = "https://github.com/subconscious-systems/dlr"
-homepage = "https://github.com/subconscious-systems/dlr"
+repository = "https://github.com/danielsuit/dlr"
+homepage = "https://github.com/danielsuit/dlr"
 
 [workspace.dependencies]
 dlr-core    = { path = "crates/core" }

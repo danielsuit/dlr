@@ -1,6 +1,6 @@
 # DLR
 
-[![CI](https://github.com/subconscious-systems/dlr/actions/workflows/ci.yml/badge.svg)](https://github.com/subconscious-systems/dlr/actions/workflows/ci.yml)
+[![CI](https://github.com/danielsuit/dlr/actions/workflows/ci.yml/badge.svg)](https://github.com/danielsuit/dlr/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 
@@ -43,7 +43,7 @@ or KV caching such as SGLang RadixAttention; it does not replace it.
 Clone and verify the workspace:
 
 ```sh
-git clone https://github.com/subconscious-systems/dlr.git
+git clone https://github.com/danielsuit/dlr.git
 cd dlr
 cargo test --locked --workspace --all-targets
 ```
