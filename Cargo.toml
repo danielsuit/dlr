@@ -8,14 +8,18 @@ members = [
     "crates/shim",
     "crates/receiver",
     "crates/prune",
+    "crates/sidecar",
     "crates/bin",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 authors = ["Daniel Suit"]
+repository = "https://github.com/subconscious-systems/dlr"
+homepage = "https://github.com/subconscious-systems/dlr"
 
 [workspace.dependencies]
 dlr-core    = { path = "crates/core" }
@@ -27,6 +31,15 @@ dlr-receiver = { path = "crates/receiver" }
 dlr-prune  = { path = "crates/prune" }
 
 blake3   = "1"
+axum     = "0.8"
+clap     = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+http-body-util = "0.1"
+reqwest  = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+serde    = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio    = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tower    = { version = "0.5", features = ["util"] }
 bytes    = "1"
 thiserror = "1"
 zstd     = { version = "0.13", features = ["experimental"] }

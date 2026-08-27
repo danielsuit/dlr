@@ -16,3 +16,6 @@
 # Local env / secrets
 .env
 .env.local
+
+# Local sidecar receiver state
+*.wal

@@ -19,7 +19,7 @@ use dlr_core::{
     decode_frame_bytes, encode_frame, Block, BlockKind, ContentStore, CuckooFilter, Frame,
     FrameBlock, MerkleRoot, ROOT_ZERO,
 };
-use dlr_receiver::Receiver;
+use dlr_receiver::{Receiver, ReceiverError};
 use dlr_shim::Shim;
 
 const SID_A: u128 = 0xA;
@@ -126,6 +126,99 @@ fn steady_state_roundtrip() {
         assert_eq!(g.seq, e.seq);
         assert_eq!(g.payload, e.payload, "payload mismatch at seq {}", e.seq);
     }
+}
+
+#[test]
+fn lost_ack_replay_is_idempotent() {
+    let (shim, receiver) = harness();
+    let append = shim.ingest(SID_A, vec![block(1, payload(1, 128))]);
+
+    let first = receiver
+        .handle_append(append.clone())
+        .expect("first append");
+    assert_eq!(receiver.reconstruct(SID_A).len(), 1);
+
+    // Simulate an ACK disappearing in the network. The sender replays the
+    // identical frame with its old base root; the receiver recognizes that
+    // the target root is already current and must not append a second copy.
+    let replay = receiver.handle_append(append).expect("idempotent replay");
+    assert_eq!(replay.root, first.root);
+    assert_eq!(receiver.reconstruct(SID_A).len(), 1);
+}
+
+#[test]
+fn invalid_tail_reference_rejects_the_whole_append() {
+    let (shim, receiver) = harness();
+    let mut append = shim.ingest(SID_A, vec![block(1, payload(2, 128))]);
+    append.blocks.push(FrameBlock::Ref([0xabu8; 32]));
+
+    assert!(matches!(
+        receiver.handle_append(append),
+        Err(ReceiverError::MissingRef)
+    ));
+    assert_eq!(receiver.store().session_len(SID_A), 0);
+    assert_eq!(receiver.store().session_root(SID_A), ROOT_ZERO);
+}
+
+#[test]
+fn wal_repairs_a_truncated_tail_before_future_appends() {
+    use std::io::Write;
+
+    let wal_path = std::env::temp_dir().join(format!(
+        "dlr-truncated-tail-{}-{}.wal",
+        std::process::id(),
+        SID_A
+    ));
+    let _ = std::fs::remove_file(&wal_path);
+
+    let first = block(1, payload(3, 64));
+    let first_root = {
+        let store = ContentStore::with_wal(&wal_path).expect("create wal");
+        store.insert(SID_A, first.clone());
+        store.flush_wal(true).expect("flush first record");
+        store.session_root(SID_A)
+    };
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .unwrap()
+        .write_all(b"partial")
+        .unwrap();
+
+    let second = block(2, payload(4, 64));
+    let final_root = {
+        let store = ContentStore::with_wal(&wal_path).expect("repair and replay wal");
+        assert_eq!(store.session_root(SID_A), first_root);
+        store.insert(SID_A, second.clone());
+        store.flush_wal(true).expect("flush second record");
+        store.session_root(SID_A)
+    };
+
+    let recovered = ContentStore::with_wal(&wal_path).expect("replay repaired wal");
+    assert_eq!(recovered.session_root(SID_A), final_root);
+    let blocks = recovered.reconstruct(SID_A);
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].payload, first.payload);
+    assert_eq!(blocks[1].payload, second.payload);
+    let _ = std::fs::remove_file(wal_path);
+}
+
+#[test]
+fn wal_rejects_a_second_live_writer() {
+    let wal_path = std::env::temp_dir().join(format!(
+        "dlr-exclusive-writer-{}-{}.wal",
+        std::process::id(),
+        SID_A
+    ));
+    let _ = std::fs::remove_file(&wal_path);
+    let first = ContentStore::with_wal(&wal_path).expect("first WAL writer");
+    assert!(
+        ContentStore::with_wal(&wal_path).is_err(),
+        "a second live writer must not acquire the same WAL"
+    );
+    drop(first);
+    ContentStore::with_wal(&wal_path).expect("lock released after writer drop");
+    let _ = std::fs::remove_file(wal_path);
 }
 
 #[test]

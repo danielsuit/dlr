@@ -28,7 +28,7 @@
 //! disturbing that order — so an out-of-order cold start replays to the same root.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use parking_lot::Mutex;
@@ -47,6 +47,7 @@ const VAR_SEED: u8 = 2;
 /// WITHOUT appending to the session log (the log was seeded by `VAR_SEED`).
 const VAR_CONTENT: u8 = 3;
 const HEADER: usize = 16 + 1 + 4;
+const MAX_RECORD_BYTES: usize = 512 * 1024 * 1024;
 // NOTE: `HEADER` is still referenced by `replay` (which reads a fixed-size
 // header buffer); the append path now writes the fields directly instead of
 // building a `HEADER`-sized `Vec`, so this constant is no longer used for the
@@ -63,14 +64,29 @@ impl Wal {
     /// and return a handle for further appends.
     pub fn open<P: AsRef<Path>>(path: P, store: &ContentStore) -> std::io::Result<Self> {
         let path = path.as_ref();
-        // Replay first, from any existing log, before opening for append.
-        if path.exists() {
-            let f = File::open(path)?;
-            replay(BufReader::new(f), store)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        // A WAL has exactly one writer. Without an OS lock, two sidecars can
+        // interleave records and acknowledge state that cannot be replayed.
+        file.try_lock()?;
+        let original_len = file.metadata()?.len();
+        let valid_len = {
+            let mut reader = BufReader::new(&file);
+            replay(&mut reader, store)?
+        };
+        // A process may die between any of the small writes that form a record.
+        // Remove that incomplete tail before appending; otherwise every future
+        // record would sit behind an unreplayable gap and be lost on restart.
+        if valid_len < original_len {
+            file.set_len(valid_len)?;
         }
-        let f = OpenOptions::new().create(true).append(true).open(path)?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Self {
-            writer: Mutex::new(BufWriter::new(f)),
+            writer: Mutex::new(BufWriter::new(file)),
         })
     }
 
@@ -85,10 +101,11 @@ impl Wal {
         // already batches the four small writes into one logical record; the
         // on-disk format is byte-identical and the per-durable-append
         // payload-sized allocation disappears.
+        let len = record_len(canonical.len())?;
         let mut w = self.writer.lock();
         w.write_all(&session_id.to_le_bytes())?;
         w.write_all(&[VAR_INSERT])?;
-        w.write_all(&(canonical.len() as u32).to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
         w.write_all(canonical)
     }
 
@@ -111,12 +128,25 @@ impl Wal {
         ids: &[[u8; 32]],
         root: &[u8; 32],
     ) -> std::io::Result<()> {
+        let payload_len = ids
+            .len()
+            .checked_mul(32)
+            .and_then(|len| len.checked_add(36))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "WAL seed too large")
+            })?;
+        let len = record_len(payload_len)?;
+        let count = u32::try_from(ids.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL seed has too many ids",
+            )
+        })?;
         let mut w = self.writer.lock();
         w.write_all(&session_id.to_le_bytes())?;
         w.write_all(&[VAR_SEED])?;
-        let len = 4 + ids.len() * 32 + 32;
-        w.write_all(&(len as u32).to_le_bytes())?;
-        w.write_all(&(ids.len() as u32).to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
+        w.write_all(&count.to_le_bytes())?;
         for id in ids {
             w.write_all(&id[..])?;
         }
@@ -126,10 +156,11 @@ impl Wal {
     /// Append a CONTENT record: cold-start block content (BULK). Replayed as
     /// content-only (no session-log append). Same payload shape as `append_insert`.
     pub fn append_content(&self, session_id: u128, canonical: &[u8]) -> std::io::Result<()> {
+        let len = record_len(canonical.len())?;
         let mut w = self.writer.lock();
         w.write_all(&session_id.to_le_bytes())?;
         w.write_all(&[VAR_CONTENT])?;
-        w.write_all(&(canonical.len() as u32).to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
         w.write_all(canonical)
     }
 
@@ -146,23 +177,38 @@ impl Wal {
     }
 }
 
-fn replay<R: Read>(mut r: R, store: &ContentStore) -> std::io::Result<()> {
+fn record_len(len: usize) -> std::io::Result<u32> {
+    if len > MAX_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("WAL record length {len} exceeds safety limit"),
+        ));
+    }
+    u32::try_from(len)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "WAL record too large"))
+}
+
+fn replay<R: Read + Seek>(r: &mut R, store: &ContentStore) -> std::io::Result<u64> {
     let mut hdr = [0u8; HEADER];
     loop {
-        match read_exact(&mut r, &mut hdr)? {
-            true => {}
-            false => return Ok(()), // clean EOF
+        let record_start = r.stream_position()?;
+        if !read_exact_or_eof(r, &mut hdr)? {
+            return Ok(record_start);
         }
         let mut sid_bytes = [0u8; 16];
         sid_bytes.copy_from_slice(&hdr[..16]);
         let session_id = u128::from_le_bytes(sid_bytes);
         let variant = hdr[16];
         let len = u32::from_le_bytes([hdr[17], hdr[18], hdr[19], hdr[20]]) as usize;
+        if len > MAX_RECORD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL record length {len} exceeds safety limit"),
+            ));
+        }
         let mut payload = vec![0u8; len];
-        if !read_exact(&mut r, &mut payload)? {
-            // truncated tail: a crash mid-append. Stop replay at the last
-            // complete record — the next append resumes cleanly.
-            return Ok(());
+        if !read_exact_or_eof(r, &mut payload)? {
+            return Ok(record_start);
         }
         match variant {
             VAR_INSERT => {
@@ -183,8 +229,8 @@ fn replay<R: Read>(mut r: R, store: &ContentStore) -> std::io::Result<()> {
                 // re-log (the WAL is still unset during replay).
                 if payload.len() >= 4 {
                     let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-                    let need = 4 + count * 32 + 32;
-                    if payload.len() >= need {
+                    let need = count.checked_mul(32).and_then(|n| n.checked_add(36));
+                    if need == Some(payload.len()) {
                         let mut ids = Vec::with_capacity(count);
                         for i in 0..count {
                             let mut id = [0u8; 32];
@@ -209,15 +255,13 @@ fn replay<R: Read>(mut r: R, store: &ContentStore) -> std::io::Result<()> {
     }
 }
 
-/// Read exactly `buf.len()` bytes. Returns `true` on a full read, `false` on
-/// EOF before any byte was read. A short read (some bytes then EOF) is treated
-/// as a truncated record: returns `false` and leaves `buf` partially filled.
-fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
+/// Read exactly `buf.len()` bytes, returning false for a clean or partial EOF.
+fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
     let mut got = 0;
     while got < buf.len() {
         let n = r.read(&mut buf[got..])?;
         if n == 0 {
-            return Ok(got > 0 && got == buf.len());
+            return Ok(false);
         }
         got += n;
     }

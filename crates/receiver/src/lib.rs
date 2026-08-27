@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 
@@ -37,6 +38,12 @@ pub enum ReceiverError {
     NoSession(u128),
     #[error("session {0} cold start in progress; bulk transfer not yet complete")]
     ColdStartInProgress(u128),
+    #[error("session {session_id} base root mismatch: client {client:?}, receiver {current:?}")]
+    BaseRootMismatch {
+        session_id: u128,
+        client: MerkleRoot,
+        current: MerkleRoot,
+    },
 }
 
 /// A handle the runtime uses to access an assembled session log without
@@ -80,6 +87,9 @@ pub struct Receiver {
     store: ContentStore,
     compressor: Compressor,
     sessions: Mutex<HashMap<u128, SessionState>>,
+    /// Serialize mutations within one session while allowing unrelated
+    /// sessions to decompress, decode, and persist concurrently.
+    mutation_locks: DashMap<u128, Arc<Mutex<()>>>,
 }
 
 impl Receiver {
@@ -121,7 +131,15 @@ impl Receiver {
             store,
             compressor,
             sessions,
+            mutation_locks: DashMap::new(),
         }
+    }
+
+    fn mutation_lock(&self, session_id: u128) -> Arc<Mutex<()>> {
+        self.mutation_locks
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub fn store(&self) -> &ContentStore {
@@ -138,6 +156,8 @@ impl Receiver {
     /// the receiver signals a divergence (cold start needed) by returning an
     /// error — the shim will then send RESYNC + BULK.
     pub fn handle_append(&self, frame: AppendFrame) -> Result<AckFrame, ReceiverError> {
+        let mutation_lock = self.mutation_lock(frame.session_id);
+        let _mutation_guard = mutation_lock.lock();
         // Divergence is checked against the authoritative `SessionState.root`
         // (manifest order), in the locked critical section below. An earlier
         // lock-free pre-check read `store.session_root()` (insertion /
@@ -185,6 +205,22 @@ impl Receiver {
                 }
             }
         }
+        // Validate every reference before mutating the store. A Ref may point
+        // at content already present at the receiver or at an Inline that
+        // appeared earlier in this same frame. Rejecting up front prevents a
+        // malformed tail Ref from leaving a partially-applied APPEND behind.
+        let mut available_inline = HashSet::new();
+        for item in &resolved {
+            match item {
+                Resolved::Inline { id, .. } => {
+                    available_inline.insert(*id);
+                }
+                Resolved::Ref(id) if !self.store.contains(id) && !available_inline.contains(id) => {
+                    return Err(ReceiverError::MissingRef);
+                }
+                Resolved::Ref(_) => {}
+            }
+        }
 
         let mut g = self.sessions.lock();
         let st = g.entry(frame.session_id).or_insert_with(|| SessionState {
@@ -206,11 +242,28 @@ impl Receiver {
             return Err(ReceiverError::ColdStartInProgress(frame.session_id));
         }
         let cur_root = self.store.session_root(frame.session_id);
+        // Compute the root this frame claims it will produce. If it already
+        // equals our current root, this is the common lost-ACK replay: return
+        // the same ACK without appending the blocks twice. This makes APPEND
+        // safe to retry after a response is lost.
+        let target_root = resolved.iter().fold(frame.base_root, |root, item| {
+            let id = match item {
+                Resolved::Inline { id, .. } | Resolved::Ref(id) => id,
+            };
+            dlr_core::append_root(&root, id)
+        });
         if frame.base_root != cur_root {
-            return Err(ReceiverError::Frame(format!(
-                "base_root mismatch: client base {:?} != our root {:?}; cold start required",
-                frame.base_root, cur_root
-            )));
+            if target_root == cur_root {
+                return Ok(AckFrame {
+                    session_id: frame.session_id,
+                    root: cur_root,
+                });
+            }
+            return Err(ReceiverError::BaseRootMismatch {
+                session_id: frame.session_id,
+                client: frame.base_root,
+                current: cur_root,
+            });
         }
         for r in resolved {
             match r {
@@ -222,9 +275,6 @@ impl Receiver {
                     self.store.insert_with_id(frame.session_id, block, id);
                 }
                 Resolved::Ref(id) => {
-                    if !self.store.contains(&id) {
-                        return Err(ReceiverError::MissingRef);
-                    }
                     self.store
                         .reference(frame.session_id, id)
                         .map_err(|_| ReceiverError::MissingRef)?;
@@ -240,6 +290,8 @@ impl Receiver {
     /// Handle a RESYNC frame: compute the missing block set (the ones we don't
     /// have) and return the missing ids. On a cold gateway this is all of them.
     pub fn handle_resync(&self, frame: &ResyncFrame) -> Vec<BlockId> {
+        let mutation_lock = self.mutation_lock(frame.session_id);
+        let _mutation_guard = mutation_lock.lock();
         let mut missing = Vec::new();
         for id in &frame.manifest {
             if !self.store.contains(id) {
@@ -282,6 +334,8 @@ impl Receiver {
     /// `base_root` and resumes steady state. Returns `None` otherwise (more
     /// BULK needed, or the session was already ACKed).
     pub fn handle_bulk(&self, frame: &BulkFrame) -> Result<Option<MerkleRoot>, ReceiverError> {
+        let mutation_lock = self.mutation_lock(frame.session_id);
+        let _mutation_guard = mutation_lock.lock();
         // Phase 1 (sessions lock held only briefly): fetch or create the
         // per-generation decoder, then clone its `Arc` and release the sessions
         // lock. The full fountain decode is CPU-bound; holding the single

@@ -257,6 +257,12 @@ Loopback shim; semantic-block Merkle DAG; session-keyed `APPEND` frames with `ba
 
 > **First-pass scope (decided):** core log crate + local shim on loopback/UDS, receiver as an in-process test harness. Canonical block encoding, BLAKE3 `block_id`, Merkle roots, `APPEND` frame codec, content-addressed store, property tests. QUIC/WAN and the deployment story are deferred to a second pass.
 
+**HTTP sidecar deployment (implemented):** `dlr-sidecar` carries the DLR frame
+codec over ordinary HTTP, persists receiver state to a WAL, reconstructs the
+OpenAI-compatible request beside an existing gateway, and proxies JSON/SSE
+responses without buffering. This path deliberately requires no gateway or
+SGLang changes. Native QUIC, multipath, and RDMA bindings remain later phases.
+
 **Phase 2 — cold-start & robustness.**
 RaptorQ resumable coded bulk transfer (§6.4). Golden-ratio ring placement (§6.2) + Fibonacci hashing (§6.1) for session/shard distribution. Zeckendorf framing (§6.3) on non-QUIC paths.
 

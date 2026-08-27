@@ -346,4 +346,234 @@ mod tests {
         let rec = sparse_decode(&pkts, k, s).unwrap();
         assert_eq!(rec, source);
     }
+
+    // --- correctness audit ---
+
+    /// Verify that `add` maintains true RREF: every existing row has its pivot
+    /// column eliminated by every newly-added row, and vice-versa.
+    #[test]
+    fn add_maintains_rref() {
+        let k = 4;
+        let s = 3;
+        let src: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..s).map(|j| ((i * 17 + j) & 0xFF) as u8).collect())
+            .collect();
+        let mut enc = RlncEncoder::new(src.clone(), s, 0x1234);
+        let mut dec = RlncDecoder::new(k, s);
+        for _ in 0..(k + 2) {
+            dec.add(enc.code()).unwrap();
+        }
+        // After all additions, the matrix should be in RREF:
+        // 1) Each pivot row has a 1 in its pivot column.
+        // 2) Each pivot column has zeros in all other rows.
+        for (i, &piv) in dec.pivots.iter().enumerate() {
+            assert_eq!(
+                dec.rows[i][piv], 1,
+                "row {i} pivot col {piv} should be 1 (normalized)"
+            );
+            for (j, _) in dec.rows.iter().enumerate() {
+                if j != i {
+                    assert_eq!(
+                        dec.rows[j][piv], 0,
+                        "col {piv} should be 0 in row {j} (RREF)"
+                    );
+                }
+            }
+        }
+        // Recovered symbols must match sources.
+        let rec = dec.decode().unwrap();
+        assert_eq!(rec, src);
+    }
+
+    /// Decoding with scrambled pivot order (col 2, 0, 1) must map outputs correctly.
+    #[test]
+    fn scrambled_pivot_order_maps_correctly() {
+        let k = 3;
+        let s = 2;
+        let src = vec![vec![0xAB, 0xCD], vec![0xEF, 0x01], vec![0x23, 0x45]];
+        let mut dec = RlncDecoder::new(k, s);
+        // Add unit vectors in order: col 2, col 0, col 1
+        dec.add(CodedPacket {
+            coeffs: vec![0, 0, 1],
+            payload: src[2].clone(),
+        })
+        .unwrap();
+        dec.add(CodedPacket {
+            coeffs: vec![1, 0, 0],
+            payload: src[0].clone(),
+        })
+        .unwrap();
+        dec.add(CodedPacket {
+            coeffs: vec![0, 1, 0],
+            payload: src[1].clone(),
+        })
+        .unwrap();
+        assert_eq!(dec.pivots, vec![2, 0, 1]);
+        let rec = dec.decode().unwrap();
+        assert_eq!(
+            rec, src,
+            "scrambled pivots must still map outputs correctly"
+        );
+    }
+
+    /// Adding a linearly dependent packet must NOT increase rank.
+    #[test]
+    fn linearly_dependent_packet_does_not_increase_rank() {
+        let k = 2;
+        let s = 4;
+        let src = [vec![0x11, 0x22, 0x33, 0x44], vec![0xAA, 0xBB, 0xCC, 0xDD]];
+        let mut dec = RlncDecoder::new(k, s);
+        // [1,0] -> src[0]
+        dec.add(CodedPacket {
+            coeffs: vec![1, 0],
+            payload: src[0].clone(),
+        })
+        .unwrap();
+        assert_eq!(dec.rank(), 1);
+        // [1,1] -> src[0] ^ src[1]
+        let mut combined = vec![0u8; s];
+        for i in 0..s {
+            combined[i] = src[0][i] ^ src[1][i];
+        }
+        let increased = dec
+            .add(CodedPacket {
+                coeffs: vec![1, 1],
+                payload: combined,
+            })
+            .unwrap();
+        assert_eq!(dec.rank(), 2);
+        assert!(increased);
+        // [0,1] is now linearly dependent (it's src[1] = [1,1] ^ [1,0])
+        let dep = dec
+            .add(CodedPacket {
+                coeffs: vec![0, 1],
+                payload: src[1].clone(),
+            })
+            .unwrap();
+        assert!(!dep, "dependent packet must not increase rank");
+        assert_eq!(dec.rank(), 2);
+    }
+
+    /// `decode` must reject when rank < K.
+    #[test]
+    fn decode_rejects_insufficient_rank() {
+        let k = 4;
+        let s = 8;
+        let src: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..s).map(|j| ((i * 29 + j) & 0xFF) as u8).collect())
+            .collect();
+        let mut enc = RlncEncoder::new(src, s, 0xCAFE);
+        let mut dec = RlncDecoder::new(k, s);
+        // only add 2 packets (rank 2 < k=4)
+        for _ in 0..2 {
+            dec.add(enc.code()).unwrap();
+        }
+        assert_eq!(dec.rank(), 2);
+        let err = dec.decode().unwrap_err();
+        assert!(matches!(err, RlncError::Insufficient { have: 2, need: 4 }));
+    }
+
+    /// `code_sparse` with degree > K should clamp to K.
+    #[test]
+    fn code_sparse_clamps_degree() {
+        let k = 4;
+        let s = 8;
+        let src: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..s).map(|j| ((i * 29 + j) & 0xFF) as u8).collect())
+            .collect();
+        let mut enc = RlncEncoder::new(src.clone(), s, 0xF00D);
+        let p = enc.code_sparse(100); // degree > K
+        let nz = p.coeffs.iter().filter(|&&c| c != 0).count();
+        assert!(nz <= k, "sparse degree must not exceed K");
+        assert!(
+            nz >= 1,
+            "sparse packet must have at least one nonzero coeff"
+        );
+    }
+
+    /// `code_sparse` must not produce all-zero coefficients even for K=1.
+    /// The coefficient is a random nonzero value, so payload = c * src[0],
+    /// not src[0] — verify the product instead.
+    #[test]
+    fn code_sparse_k1_nonzero() {
+        let k = 1;
+        let s = 4;
+        let src = vec![vec![0xDE, 0xAD, 0xBE, 0xEF]];
+        let mut enc = RlncEncoder::new(src.clone(), s, 0x1);
+        let p = enc.code_sparse(1);
+        assert!(
+            p.coeffs[0] != 0,
+            "K=1 sparse packet must have nonzero coeff"
+        );
+        let mut expected = vec![0u8; s];
+        for i in 0..s {
+            expected[i] = gf256::mul(p.coeffs[0], src[0][i]);
+        }
+        assert_eq!(p.payload, expected);
+        // And it must still decode
+        let rec = sparse_decode(&[p], k, s).unwrap();
+        assert_eq!(rec, src);
+    }
+
+    /// Peeling + residual must correctly decode when the fountain's own
+    /// `peel_decode` path is used via `sparse_decode`. Use degree 3 and enough
+    /// packets for the coverage to be full with high probability.
+    #[test]
+    fn sparse_decode_with_residual() {
+        let k = 8;
+        let s = 4;
+        let src: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..s).map(|j| ((i * 37 + j) & 0xFF) as u8).collect())
+            .collect();
+        let mut enc = RlncEncoder::new(src.clone(), s, 0x9999);
+        let mut pkts = Vec::new();
+        for _ in 0..(k + 8) {
+            pkts.push(enc.code_sparse(3));
+        }
+        let rec = sparse_decode(&pkts, k, s).unwrap();
+        assert_eq!(rec, src);
+    }
+
+    /// Dense `code()` must produce valid linear combinations: encoding with
+    /// the coefficient vector and then decoding via direct Gaussian must
+    /// recover sources.
+    #[test]
+    fn code_produces_valid_linear_combinations() {
+        let k = 16;
+        let s = 32;
+        let src: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..s).map(|j| ((i * 53 + j) & 0xFF) as u8).collect())
+            .collect();
+        let mut enc = RlncEncoder::new(src.clone(), s, 0x4242);
+        // Manually verify: payload = sum(g_i * x_i) in GF(256)
+        let p = enc.code();
+        let mut expected = vec![0u8; s];
+        for (i, &c) in p.coeffs.iter().enumerate() {
+            if c != 0 {
+                gf256::axpy(&mut expected, c, &src[i]);
+            }
+        }
+        assert_eq!(
+            p.payload, expected,
+            "coded payload must match manual GF(256) sum"
+        );
+    }
+
+    /// Re-adding the SAME packet (identical coefficients + payload) must be
+    /// idempotent — rank must not increase.
+    #[test]
+    fn readding_same_packet_is_idempotent() {
+        let k = 4;
+        let s = 8;
+        let src: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..s).map(|j| ((i * 29 + j) & 0xFF) as u8).collect())
+            .collect();
+        let mut enc = RlncEncoder::new(src, s, 0xBEEF);
+        let mut dec = RlncDecoder::new(k, s);
+        let p = enc.code();
+        let r1 = dec.add(p.clone()).unwrap();
+        assert!(r1);
+        let r2 = dec.add(p).unwrap();
+        assert!(!r2, "re-adding the same packet must not increase rank");
+    }
 }

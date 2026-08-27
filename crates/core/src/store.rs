@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use parking_lot::Mutex;
 
 use crate::block::{Block, BlockId};
 use crate::canonical::canonical_bytes;
@@ -71,6 +72,10 @@ pub struct ContentStore {
     /// in-memory only. `OnceLock` is set once via `&self` (at setup, before the
     /// store is shared across threads) and read cheaply on the hot path.
     wal: std::sync::OnceLock<Option<Arc<Wal>>>,
+    /// First asynchronous WAL append failure. Store mutation APIs intentionally
+    /// remain allocation-friendly and infallible, so an error is latched here
+    /// and surfaced by `flush_wal` before a caller exposes an ACK.
+    wal_error: Arc<Mutex<Option<(std::io::ErrorKind, String)>>>,
 }
 
 struct SessionLog {
@@ -96,6 +101,7 @@ impl ContentStore {
                 sessions: AtomicU64::new(0),
             }),
             wal: std::sync::OnceLock::new(),
+            wal_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -128,9 +134,30 @@ impl ContentStore {
     /// Flush the WAL buffer. With `sync=true`, fsync so records survive a crash.
     /// No-op if no WAL is attached.
     pub fn flush_wal(&self, sync: bool) -> std::io::Result<()> {
-        match self.wal() {
+        if let Some((kind, message)) = self.wal_error.lock().as_ref() {
+            return Err(std::io::Error::new(*kind, message.clone()));
+        }
+        let result = match self.wal() {
             Some(w) => w.flush(sync),
             None => Ok(()),
+        };
+        if let Err(error) = result {
+            self.latch_wal_error(&error);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn record_wal_result(&self, result: std::io::Result<()>) {
+        if let Err(error) = result {
+            self.latch_wal_error(&error);
+        }
+    }
+
+    fn latch_wal_error(&self, error: &std::io::Error) {
+        let mut slot = self.wal_error.lock();
+        if slot.is_none() {
+            *slot = Some((error.kind(), error.to_string()));
         }
     }
 
@@ -225,16 +252,16 @@ impl ContentStore {
                 if let Some(b) = block_for_wal {
                     match canonical {
                         Some(c) => {
-                            let _ = wal.append_insert(session_id, c);
+                            self.record_wal_result(wal.append_insert(session_id, c));
                         }
                         None => {
                             let c = canonical_bytes(&b);
-                            let _ = wal.append_insert(session_id, &c);
+                            self.record_wal_result(wal.append_insert(session_id, &c));
                         }
                     }
                 }
             } else {
-                let _ = wal.append_reference(session_id, id);
+                self.record_wal_result(wal.append_reference(session_id, id));
             }
         }
         newly
@@ -263,7 +290,7 @@ impl ContentStore {
         self.stats.blocks_deduped.fetch_add(1, Ordering::Relaxed);
         let wal = self.wal();
         if let Some(wal) = wal {
-            let _ = wal.append_reference(session_id, id);
+            self.record_wal_result(wal.append_reference(session_id, id));
         }
         Ok(())
     }
@@ -300,7 +327,7 @@ impl ContentStore {
             self.stats.sessions.fetch_add(1, Ordering::Relaxed);
         }
         if let (Some(wal), Some(ids)) = (wal, wal_ids) {
-            let _ = wal.append_seed(session_id, &ids, &root);
+            self.record_wal_result(wal.append_seed(session_id, &ids, &root));
         }
     }
 
@@ -339,7 +366,7 @@ impl ContentStore {
                     // Re-derive canonical only on the WAL path (no-WAL fast path
                     // touches no payload-sized alloc); same trade as `insert_with_id`.
                     let c = canonical_bytes(&b);
-                    let _ = wal.append_content(session_id, &c);
+                    self.record_wal_result(wal.append_content(session_id, &c));
                 }
             }
             // dedup: content is already durably present, log nothing.

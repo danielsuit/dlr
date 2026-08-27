@@ -814,3 +814,42 @@ verify the existing divergence demo path still triggers RESYNC.
 5. **Before any of it:** re-confirm the build (`cargo build --release`) and fix
    the pre-existing decode/hash test failures noted in Part I, since #25/#33
    touch that exact code.
+
+---
+
+## Implemented integration hot paths (Subconscious Code)
+
+- The client retains ACKed `WireMessage` snapshots. Their large bodies are
+  immutable `Arc<str>` values, so pointer equality proves the stable prefix.
+  Only newly appended messages are materialized, their one required DLR
+  serialization also supplies exact payload accounting, and a cached aggregate
+  removes history-wide bookkeeping allocations. Reallocated but byte-equal
+  messages remain correct through a content-comparison fallback.
+- The HTTP sidecar reconstructs the upstream JSON request as a stream of the
+  content store's existing refcounted `Bytes`, eliminating the full-history
+  `Value` tree and the second contiguous serialization copy.
+- A validated projection is cached by `(session_id, MerkleRoot)`. A trusted
+  steady APPEND fetches only new blocks instead of reconstructing the complete
+  store manifest. Small messages are coalesced into roughly 64 KiB upstream
+  chunks while large blocks retain zero-copy storage. The generic frame
+  endpoint invalidates the cache before RESYNC/BULK/APPEND mutations, forcing
+  one safe full validation and projection rebuild on the next chat request.
+  The LRU is bounded to 64 sessions and 256 MiB of represented JSON so this
+  acceleration cannot grow without limit.
+
+On the Mac-to-Spark immediate-SSE benchmark with generated Rust-shaped text,
+these changes reduced median steady-state DLR request-to-first-SSE time from
+61 to 26 ms at 10 MiB, 201 to 30 ms at 25 MiB, and 302 to 34 ms at 45 MiB.
+
+A subsequent pass removed the duplicate new-message bookkeeping serialization,
+cached aggregate JSON size, cached the ACK-root projection, and coalesced small
+blocks. The next five-sample Spark run observed 12.1 ms at 10 MiB, 16.4 ms at
+25 MiB, and 21.8 ms at 45 MiB. Network load and RTT vary between runs, so these
+figures are the latest observed end-to-end transport medians rather than an
+isolated attribution of every millisecond to the code change.
+
+The release-mode projection ablation is deterministic: for a 10,000-message
+history, the former store walk and 19,999-entry chunk-plan rebuild cost 0.466 ms
+per request; the cached lookup cost 0.052 microseconds and retained only 80
+upstream chunks. A Spark stress run with 4 KiB history blocks stayed at 9.7 ms
+median for 2,560 messages / 10 MiB and 17.2 ms for 6,400 messages / 25 MiB.
