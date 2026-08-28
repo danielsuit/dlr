@@ -107,6 +107,18 @@ The binary envelope is capped at 64 MiB, with request metadata capped at
 
 ## Container deployment
 
+Published multi-architecture images are available from GHCR. Production
+deployments should pin an immutable digest rather than relying on a mutable
+tag:
+
+```sh
+docker pull ghcr.io/danielsuit/dlr-sidecar:latest
+```
+
+Every published image includes GitHub build-provenance attestation. Main-branch
+builds publish `latest` and `sha-<commit>`; version tags additionally publish
+the matching semantic-version tags.
+
 ```sh
 docker build -t dlr-sidecar .
 docker run --rm -p 32180:32180 \
